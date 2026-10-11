@@ -1,0 +1,106 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install ruff
+      - run: python -m ruff format --check .
+      - run: python -m ruff check .
+      - run: python -B -m unittest discover -s . -p "test_*.py"
+
+  build:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Download Python runtime
+        run: |
+          Invoke-WebRequest 'https://www.python.org/ftp/python/3.14.8/python-3.14.8-embeddable-amd64.zip' -OutFile "$env:RUNNER_TEMP/python-runtime.zip"
+      - name: Build installation packages
+        run: python -B build.py --runtime-archive "$env:RUNNER_TEMP/python-runtime.zip"
+      - name: Check bundled Windows runtime
+        run: |
+          Expand-Archive 'dist/LeiKwanForward-windows-x64.zip' "$env:RUNNER_TEMP/package"
+          $package = "$env:RUNNER_TEMP/package/LeiKwanForward"
+          & "$package/runtime/python.exe" -X utf8 -B -m unittest discover -s $package -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$package/LeiKwanForward.cmd" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$package/install-windows-forward.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: LeiKwanForward-packages
+          path: |
+            dist/LeiKwanForward-windows-x64.zip
+            dist/LeiKwanForward-windows-x64.zip.sha256
+            dist/LeiKwanForward-linux.tar.gz
+            dist/LeiKwanForward-linux.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Release notes are read from the local annotated tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: LeiKwanForward-packages
+          path: packages
+      - name: Verify package checksums
+        working-directory: packages
+        run: sha256sum --check *.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            packages/LeiKwanForward-windows-x64.zip \
+            packages/LeiKwanForward-windows-x64.zip.sha256 \
+            packages/LeiKwanForward-linux.tar.gz \
+            packages/LeiKwanForward-linux.tar.gz.sha256 \
+            --verify-tag --title "$RELEASE_TAG" --notes-from-tag
